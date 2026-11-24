@@ -88,51 +88,35 @@ func parseRFCVectors(t *testing.T, path string) []rfcVector {
 	return vecs
 }
 
-// polyvalPaths runs fn with POLYVAL forced to each implementation: direct
-// dot multiplications only, and tables only.
-func polyvalPaths(t *testing.T, fn func(t *testing.T)) {
-	t.Helper()
-	defer func(v int) { directDotsThreshold = v }(directDotsThreshold)
-	t.Run("direct", func(t *testing.T) {
-		directDotsThreshold = 1 << 30
-		fn(t)
-	})
-	t.Run("tables", func(t *testing.T) {
-		directDotsThreshold = 0
-		fn(t)
-	})
-}
-
 func TestRFC8452Vectors(t *testing.T) {
-	polyvalPaths(t, func(t *testing.T) {
-		files := []string{"testdata/rfc8452_aes128.txt", "testdata/rfc8452_aes256.txt"}
-		for _, f := range files {
-			for i, v := range parseRFCVectors(t, f) {
-				aead, err := New(v.key)
-				if err != nil {
-					t.Fatalf("%s#%d: %v", f, i, err)
-				}
-				sealed := aead.Seal(nil, v.nonce, v.in, v.ad)
-				want := append(append([]byte{}, v.ct...), v.tag...)
-				if !bytes.Equal(sealed, want) {
-					t.Fatalf("%s#%d: Seal mismatch\ngot  %x\nwant %x", f, i, sealed, want)
-				}
-				opened, err := aead.Open(nil, v.nonce, sealed, v.ad)
-				if err != nil {
-					t.Fatalf("%s#%d: Open failed: %v", f, i, err)
-				}
-				if !bytes.Equal(opened, v.in) {
-					t.Fatalf("%s#%d: Open mismatch\ngot  %x\nwant %x", f, i, opened, v.in)
-				}
-				// Flipping any tag bit must fail authentication.
-				bad := append([]byte{}, sealed...)
-				bad[len(bad)-1] ^= 1
-				if _, err := aead.Open(nil, v.nonce, bad, v.ad); err == nil {
-					t.Fatalf("%s#%d: Open accepted forged tag", f, i)
-				}
+	requireHardwareAES(t)
+	files := []string{"testdata/rfc8452_aes128.txt", "testdata/rfc8452_aes256.txt"}
+	for _, f := range files {
+		for i, v := range parseRFCVectors(t, f) {
+			aead, err := New(v.key)
+			if err != nil {
+				t.Fatalf("%s#%d: %v", f, i, err)
+			}
+			sealed := aead.Seal(nil, v.nonce, v.in, v.ad)
+			want := append(append([]byte{}, v.ct...), v.tag...)
+			if !bytes.Equal(sealed, want) {
+				t.Fatalf("%s#%d: Seal mismatch\ngot  %x\nwant %x", f, i, sealed, want)
+			}
+			opened, err := aead.Open(nil, v.nonce, sealed, v.ad)
+			if err != nil {
+				t.Fatalf("%s#%d: Open failed: %v", f, i, err)
+			}
+			if !bytes.Equal(opened, v.in) {
+				t.Fatalf("%s#%d: Open mismatch\ngot  %x\nwant %x", f, i, opened, v.in)
+			}
+			// Flipping any tag bit must fail authentication.
+			bad := append([]byte{}, sealed...)
+			bad[len(bad)-1] ^= 1
+			if _, err := aead.Open(nil, v.nonce, bad, v.ad); err == nil {
+				t.Fatalf("%s#%d: Open accepted forged tag", f, i)
 			}
 		}
-	})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -159,60 +143,59 @@ type wycheproofFile struct {
 }
 
 func TestWycheproof(t *testing.T) {
-	polyvalPaths(t, func(t *testing.T) {
-		data, err := os.ReadFile("testdata/wycheproof_aes_gcm_siv.json")
-		if err != nil {
-			t.Fatal(err)
+	requireHardwareAES(t)
+	data, err := os.ReadFile("testdata/wycheproof_aes_gcm_siv.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf wycheproofFile
+	if err := json.Unmarshal(data, &wf); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, g := range wf.TestGroups {
+		if g.IvSize != 96 || g.TagSize != 128 || (g.KeySize != 128 && g.KeySize != 256) {
+			t.Fatalf("unexpected group sizes %+v", g)
 		}
-		var wf wycheproofFile
-		if err := json.Unmarshal(data, &wf); err != nil {
-			t.Fatal(err)
-		}
-		n := 0
-		for _, g := range wf.TestGroups {
-			if g.IvSize != 96 || g.TagSize != 128 || (g.KeySize != 128 && g.KeySize != 256) {
-				t.Fatalf("unexpected group sizes %+v", g)
+		for _, tc := range g.Tests {
+			n++
+			key := mustHex(t, tc.Key)
+			iv := mustHex(t, tc.Iv)
+			aad := mustHex(t, tc.Aad)
+			msg := mustHex(t, tc.Msg)
+			ct := mustHex(t, tc.Ct)
+			tag := mustHex(t, tc.Tag)
+			aead, err := New(key)
+			if err != nil {
+				t.Fatalf("tcId %d: %v", tc.TcID, err)
 			}
-			for _, tc := range g.Tests {
-				n++
-				key := mustHex(t, tc.Key)
-				iv := mustHex(t, tc.Iv)
-				aad := mustHex(t, tc.Aad)
-				msg := mustHex(t, tc.Msg)
-				ct := mustHex(t, tc.Ct)
-				tag := mustHex(t, tc.Tag)
-				aead, err := New(key)
+			ctAndTag := append(append([]byte{}, ct...), tag...)
+			switch tc.Result {
+			case "valid":
+				sealed := aead.Seal(nil, iv, msg, aad)
+				if !bytes.Equal(sealed, ctAndTag) {
+					t.Fatalf("tcId %d: Seal mismatch\ngot  %x\nwant %x", tc.TcID, sealed, ctAndTag)
+				}
+				opened, err := aead.Open(nil, iv, ctAndTag, aad)
 				if err != nil {
-					t.Fatalf("tcId %d: %v", tc.TcID, err)
+					t.Fatalf("tcId %d: Open failed: %v", tc.TcID, err)
 				}
-				ctAndTag := append(append([]byte{}, ct...), tag...)
-				switch tc.Result {
-				case "valid":
-					sealed := aead.Seal(nil, iv, msg, aad)
-					if !bytes.Equal(sealed, ctAndTag) {
-						t.Fatalf("tcId %d: Seal mismatch\ngot  %x\nwant %x", tc.TcID, sealed, ctAndTag)
-					}
-					opened, err := aead.Open(nil, iv, ctAndTag, aad)
-					if err != nil {
-						t.Fatalf("tcId %d: Open failed: %v", tc.TcID, err)
-					}
-					if !bytes.Equal(opened, msg) {
-						t.Fatalf("tcId %d: Open mismatch", tc.TcID)
-					}
-				case "invalid":
-					if _, err := aead.Open(nil, iv, ctAndTag, aad); err == nil {
-						t.Fatalf("tcId %d: Open accepted invalid vector (flags %v)", tc.TcID, tc.Flags)
-					}
-				default:
-					t.Fatalf("tcId %d: unknown result %q", tc.TcID, tc.Result)
+				if !bytes.Equal(opened, msg) {
+					t.Fatalf("tcId %d: Open mismatch", tc.TcID)
 				}
+			case "invalid":
+				if _, err := aead.Open(nil, iv, ctAndTag, aad); err == nil {
+					t.Fatalf("tcId %d: Open accepted invalid vector (flags %v)", tc.TcID, tc.Flags)
+				}
+			default:
+				t.Fatalf("tcId %d: unknown result %q", tc.TcID, tc.Result)
 			}
 		}
-		if n == 0 {
-			t.Fatal("no Wycheproof tests ran")
-		}
-		t.Logf("%d Wycheproof cases", n)
-	})
+	}
+	if n == 0 {
+		t.Fatal("no Wycheproof tests ran")
+	}
+	t.Logf("%d Wycheproof cases", n)
 }
 
 // ---------------------------------------------------------------------------
@@ -220,43 +203,43 @@ func TestWycheproof(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRoundTrip(t *testing.T) {
-	polyvalPaths(t, func(t *testing.T) {
-		rng := rand.New(rand.NewSource(0xC0FFEE))
-		ptLens := []int{0, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 100, 255, 256, 1000, 1024, 4096, 16384, 65536}
-		adLens := []int{0, 1, 5, 16, 17, 100, 1000}
-		for _, keyLen := range []int{16, 32} {
-			key := make([]byte, keyLen)
-			rng.Read(key)
-			aead, err := New(key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			nonce := make([]byte, NonceSize)
-			rng.Read(nonce)
-			for _, ptLen := range ptLens {
-				pt := make([]byte, ptLen)
-				rng.Read(pt)
-				for _, adLen := range adLens {
-					ad := make([]byte, adLen)
-					rng.Read(ad)
-					sealed := aead.Seal(nil, nonce, pt, ad)
-					if len(sealed) != ptLen+TagSize {
-						t.Fatalf("key=%d pt=%d ad=%d: sealed len %d", keyLen, ptLen, adLen, len(sealed))
-					}
-					opened, err := aead.Open(nil, nonce, sealed, ad)
-					if err != nil {
-						t.Fatalf("key=%d pt=%d ad=%d: %v", keyLen, ptLen, adLen, err)
-					}
-					if !bytes.Equal(opened, pt) {
-						t.Fatalf("key=%d pt=%d ad=%d: mismatch", keyLen, ptLen, adLen)
-					}
+	requireHardwareAES(t)
+	rng := rand.New(rand.NewSource(0xC0FFEE))
+	ptLens := []int{0, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 100, 255, 256, 1000, 1024, 4096, 16384, 65536}
+	adLens := []int{0, 1, 5, 16, 17, 100, 1000}
+	for _, keyLen := range []int{16, 32} {
+		key := make([]byte, keyLen)
+		rng.Read(key)
+		aead, err := New(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nonce := make([]byte, NonceSize)
+		rng.Read(nonce)
+		for _, ptLen := range ptLens {
+			pt := make([]byte, ptLen)
+			rng.Read(pt)
+			for _, adLen := range adLens {
+				ad := make([]byte, adLen)
+				rng.Read(ad)
+				sealed := aead.Seal(nil, nonce, pt, ad)
+				if len(sealed) != ptLen+TagSize {
+					t.Fatalf("key=%d pt=%d ad=%d: sealed len %d", keyLen, ptLen, adLen, len(sealed))
+				}
+				opened, err := aead.Open(nil, nonce, sealed, ad)
+				if err != nil {
+					t.Fatalf("key=%d pt=%d ad=%d: %v", keyLen, ptLen, adLen, err)
+				}
+				if !bytes.Equal(opened, pt) {
+					t.Fatalf("key=%d pt=%d ad=%d: mismatch", keyLen, ptLen, adLen)
 				}
 			}
 		}
-	})
+	}
 }
 
 func TestTamper(t *testing.T) {
+	requireHardwareAES(t)
 	key := bytes.Repeat([]byte{0x42}, 32)
 	aead, err := New(key)
 	if err != nil {
@@ -307,6 +290,7 @@ func TestAPI(t *testing.T) {
 			t.Fatalf("New(%d bytes) accepted", n)
 		}
 	}
+	requireHardwareAES(t)
 	aead, err := New(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -314,18 +298,9 @@ func TestAPI(t *testing.T) {
 	if aead.NonceSize() != NonceSize || aead.Overhead() != TagSize {
 		t.Fatal("bad sizes")
 	}
-	mustPanic := func(f func()) {
-		t.Helper()
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic")
-			}
-		}()
-		f()
-	}
-	mustPanic(func() { aead.Seal(nil, make([]byte, 11), nil, nil) })
-	mustPanic(func() { aead.Seal(nil, make([]byte, 13), nil, nil) })
-	mustPanic(func() { aead.Open(nil, make([]byte, 0), make([]byte, 16), nil) })
+	mustPanic(t, func() { aead.Seal(nil, make([]byte, 11), nil, nil) })
+	mustPanic(t, func() { aead.Seal(nil, make([]byte, 13), nil, nil) })
+	mustPanic(t, func() { aead.Open(nil, make([]byte, 0), make([]byte, 16), nil) })
 
 	// dst is appended to, not overwritten.
 	dst := []byte("prefix:")
@@ -360,6 +335,77 @@ func TestAPI(t *testing.T) {
 	}
 }
 
+func requireHardwareAES(t testing.TB) {
+	t.Helper()
+	if !hardwareAES {
+		t.Skip("hardware AES backend is unavailable")
+	}
+}
+
+func mustPanic(t *testing.T, f func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic")
+		}
+	}()
+	f()
+}
+
+func TestNewWithoutHardwareAES(t *testing.T) {
+	if hardwareAES {
+		t.Skip("run with purego or GODEBUG=cpu.aes=off")
+	}
+	for _, size := range []int{KeySize128, KeySize256} {
+		if aead, err := New(make([]byte, size)); aead != nil || err != errHardwareAES {
+			t.Fatalf("New(%d bytes) = %v, %v, want hardware AES error", size, aead, err)
+		}
+	}
+}
+
+func TestRFCLengthLimits(t *testing.T) {
+	const limit = uint64(1 << 36)
+	checkSealLengths(limit, limit)
+	mustPanic(t, func() { checkSealLengths(limit+1, limit) })
+	mustPanic(t, func() { checkSealLengths(limit, limit+1) })
+
+	if !validOpenLengths(TagSize, 0) || !validOpenLengths(limit+TagSize, limit) {
+		t.Fatal("Open rejected a boundary length")
+	}
+	if validOpenLengths(TagSize-1, 0) ||
+		validOpenLengths(limit+TagSize+1, 0) ||
+		validOpenLengths(TagSize, limit+1) {
+		t.Fatal("Open accepted an out-of-range length")
+	}
+}
+
+func TestBufferOverlap(t *testing.T) {
+	requireHardwareAES(t)
+	aead, err := New(make([]byte, KeySize256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, NonceSize, NonceSize+64)
+	plaintext := []byte("hello")
+	record := aead.Seal(nonce, nonce, plaintext, nil)
+	if &record[0] != &nonce[0] || !bytes.Equal(record[:NonceSize], nonce) {
+		t.Fatal("Seal failed to preserve the nonce prefix")
+	}
+	ciphertext := record[NonceSize:]
+	opened, err := aead.Open(ciphertext[:0], record[:NonceSize], ciphertext, nil)
+	if err != nil || !bytes.Equal(opened, plaintext) {
+		t.Fatalf("in-place Open with adjacent nonce = %q, %v", opened, err)
+	}
+
+	dst := make([]byte, 64)
+	mustPanic(t, func() { aead.Seal(dst[1:1], nonce, dst[:16], nil) })
+	mustPanic(t, func() { aead.Seal(dst[:0], nonce, plaintext, dst[16:17]) })
+	mustPanic(t, func() { aead.Seal(dst[:0], dst[:NonceSize], plaintext, nil) })
+	mustPanic(t, func() { aead.Open(dst[1:1], nonce, dst[:32], nil) })
+	mustPanic(t, func() { aead.Open(dst[:0], nonce, dst[16:48], dst[:1]) })
+	mustPanic(t, func() { aead.Open(dst[:0], dst[:NonceSize], dst[16:48], nil) })
+}
+
 // ---------------------------------------------------------------------------
 // RFC 8452 intermediate values (Sections 4, 8 and C.3)
 // ---------------------------------------------------------------------------
@@ -382,6 +428,7 @@ func TestFieldDoubling(t *testing.T) {
 }
 
 func TestKDFIntermediate(t *testing.T) {
+	requireHardwareAES(t)
 	// RFC 8452, Appendix C.3: zero key and nonce.
 	g, err := New(make([]byte, 32))
 	if err != nil {
@@ -413,7 +460,7 @@ func TestPOLYVALIntermediate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // The code below reimplements POLYVAL from scratch through GHASH, mirroring
-// AWS-LC's polyval.c approach, to cross-check the table implementation:
+// AWS-LC's polyval.c approach, to cross-check the table-free implementation:
 // POLYVAL(H, Xs) = rev(GHASH(mulX_GHASH(rev(H)), rev(X1), ...)).
 // GHASH uses MSB-first bit order with modulus x^128+x^7+x^2+x+1.
 
@@ -640,7 +687,7 @@ func TestGHASHRelation(t *testing.T) {
 	if want := "7367cdb411b730128dd56e8edc0eff56"; hex.EncodeToString(got[:]) != want {
 		t.Fatalf("GHASH-relation POLYVAL = %x, want %s", got, want)
 	}
-	// Randomized cross-check of both table implementations.
+	// Randomized cross-check of the production implementation.
 	rng := rand.New(rand.NewSource(0x5EED))
 	for i := 0; i < 30; i++ {
 		h := make([]byte, 16)
@@ -650,9 +697,8 @@ func TestGHASHRelation(t *testing.T) {
 		data := make([]byte, rng.Intn(100))
 		rng.Read(data)
 		want := polyvalViaGHASH(t, h, ad, data)
-		hp := dotKey(loadField(h))
 		var got [16]byte
-		polyval(hp, ad, data).store(got[:])
+		polyvalDirect(loadField(h), ad, data).store(got[:])
 		if got != want {
 			t.Fatalf("iter %d: mismatch\nrel %x\ngot %x", i, want, got)
 		}
@@ -664,6 +710,7 @@ func TestGHASHRelation(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func benchmarkSeal(b *testing.B, ptLen, adLen int) {
+	requireHardwareAES(b)
 	b.Helper()
 	aead, err := New(bytes.Repeat([]byte{0x77}, 32))
 	if err != nil {
@@ -681,6 +728,7 @@ func benchmarkSeal(b *testing.B, ptLen, adLen int) {
 }
 
 func benchmarkOpen(b *testing.B, ptLen, adLen int) {
+	requireHardwareAES(b)
 	b.Helper()
 	aead, err := New(bytes.Repeat([]byte{0x77}, 32))
 	if err != nil {
@@ -716,6 +764,7 @@ func BenchmarkOpen64K(b *testing.B)    { benchmarkOpen(b, 65536, 0) }
 func BenchmarkOpen1MAD12(b *testing.B) { benchmarkOpen(b, 1<<20, 12) }
 
 func BenchmarkDeriveKeys(b *testing.B) {
+	requireHardwareAES(b)
 	g, _ := New(bytes.Repeat([]byte{0x77}, 32))
 	nonce := bytes.Repeat([]byte{0x01}, NonceSize)
 	var authKey [16]byte
