@@ -1,0 +1,7 @@
+# Compiled test binaries (go test -c) - keep *_test.go sources, ignore outputs.
+*.test
+*.out
+
+# Coverage profiles.
+/coverage.out
+/coverage.html
