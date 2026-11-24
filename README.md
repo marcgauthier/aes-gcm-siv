@@ -159,6 +159,13 @@ Notes:
 - `polyval_bench_test.go` — internal POLYVAL tuning benchmarks.
 - `testdata/` — vector files verbatim from AWS-LC / Wycheproof.
 
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE). This package is based on
+the AES-GCM-SIV C implementation in AWS-LC; see
+[THIRD-PARTY-LICENSE.md](THIRD-PARTY-LICENSE.md) for the original
+sources and their licenses.
+
 ## Porting notes
 
 Behavior follows AWS-LC's portable (`e_aesgcmsiv.c`, non-asm) code path:
