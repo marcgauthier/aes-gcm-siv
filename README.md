@@ -1,3 +1,5 @@
+<img src="icon.png" width="256" alt="AES-GCM-SIV logo">
+
 # aes-gcm-siv
 
 Pure Go implementation of **AES-GCM-SIV** (RFC 8452), the nonce
